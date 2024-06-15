@@ -23,8 +23,8 @@ let db;
 
 // Redis setup
 const redisClient = redis.createClient({
-  host: 'localhost', 
-  port: 6379,        
+  host: 'localhost',
+  port: 6379,
 });
 
 redisClient.on('error', (error) => {
@@ -39,7 +39,7 @@ async function connectToDatabase() {
     console.log("Connected to MongoDB");
   } catch (e) {
     console.error("Error connecting to MongoDB", e);
-    process.exit(1); 
+    process.exit(1);
   }
 }
 
@@ -66,10 +66,18 @@ app.use((req, res, next) => {
 // Routes
 const router = express.Router();
 
+// Helper function to simplify movie object
+function simplifyMovie(movie) {
+  return {
+    id: movie._id,
+    name: movie.name,
+    title: movie.title
+  };
+}
+
 // GET all movies
 router.get("/", async (req, res, next) => {
   try {
-    // Try fetching movies from Redis cache
     redisClient.get('movies', async (err, cachedMovies) => {
       if (err) {
         console.error(`Error fetching movies from Redis: ${err}`);
@@ -83,9 +91,9 @@ router.get("/", async (req, res, next) => {
         console.log('No movies found in Redis cache, fetching from MongoDB');
         let collection = db.collection("movies");
         let results = await collection.find({}).limit(10).toArray();
+        let simplifiedResults = results.map(simplifyMovie);
         
-        // Cache movies in Redis
-        redisClient.set('movies', JSON.stringify(results), (err, reply) => {
+        redisClient.set('movies', JSON.stringify(simplifiedResults), (err) => {
           if (err) {
             console.error(`Error caching movies in Redis: ${err}`);
           } else {
@@ -93,7 +101,7 @@ router.get("/", async (req, res, next) => {
           }
         });
 
-        res.status(200).json(results);
+        res.status(200).json(simplifiedResults);
       }
     });
   } catch (e) {
@@ -104,14 +112,38 @@ router.get("/", async (req, res, next) => {
 // GET movie by ID
 router.get("/:id", async (req, res, next) => {
   try {
-    let collection = db.collection("movies");
-    let query = { _id: new ObjectId(req.params.id) };
-    let result = await collection.findOne(query);
-    if (!result) {
-      res.status(404).send("Not found");
-    } else {
-      res.status(200).json(result);
-    }
+    const movieId = req.params.id;
+    redisClient.get(`movie:${movieId}`, async (err, cachedMovie) => {
+      if (err) {
+        console.error(`Error fetching movie from Redis: ${err}`);
+        return next(err);
+      }
+
+      if (cachedMovie) {
+        console.log('Fetching movie from Redis cache');
+        res.json(JSON.parse(cachedMovie));
+      } else {
+        console.log('No movie found in Redis cache, fetching from MongoDB');
+        let collection = db.collection("movies");
+        let query = { _id: new ObjectId(movieId) };
+        let result = await collection.findOne(query);
+        if (!result) {
+          res.status(404).send("Not found");
+        } else {
+          let simplifiedResult = simplifyMovie(result);
+          
+          redisClient.set(`movie:${movieId}`, JSON.stringify(simplifiedResult), (err) => {
+            if (err) {
+              console.error(`Error caching movie in Redis: ${err}`);
+            } else {
+              console.log('Cached movie in Redis');
+            }
+          });
+
+          res.status(200).json(simplifiedResult);
+        }
+      }
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -120,21 +152,35 @@ router.get("/:id", async (req, res, next) => {
 // PATCH movie by ID
 router.patch("/:id", async (req, res, next) => {
   try {
-    const query = { _id: new ObjectId(req.params.id) };
+    const movieId = req.params.id;
+    const query = { _id: new ObjectId(movieId) };
     const updates = {
       $set: { title: req.body.title }
     };
     let collection = db.collection("movies");
     let result = await collection.updateOne(query, updates);
 
-    // Invalidate cache after update
-    redisClient.del('movies', (err, reply) => {
-      if (err) {
-        console.error(`Error invalidating Redis cache: ${err}`);
-      } else {
-        console.log('Invalidated Redis cache after update');
-      }
-    });
+    // Update cache after update (write-through)
+    if (result.matchedCount > 0) {
+      let updatedMovie = await collection.findOne(query);
+      let simplifiedMovie = simplifyMovie(updatedMovie);
+
+      redisClient.set(`movie:${movieId}`, JSON.stringify(simplifiedMovie), (err) => {
+        if (err) {
+          console.error(`Error updating movie in Redis: ${err}`);
+        } else {
+          console.log('Updated movie in Redis');
+        }
+      });
+
+      redisClient.del('movies', (err) => {
+        if (err) {
+          console.error(`Error invalidating Redis cache: ${err}`);
+        } else {
+          console.log('Invalidated Redis cache after update');
+        }
+      });
+    }
 
     res.status(200).json(result);
   } catch (e) {
@@ -145,12 +191,21 @@ router.patch("/:id", async (req, res, next) => {
 // DELETE movie by ID
 router.delete("/:id", async (req, res, next) => {
   try {
-    const query = { _id: new ObjectId(req.params.id) };
+    const movieId = req.params.id;
+    const query = { _id: new ObjectId(movieId) };
     let collection = db.collection("movies");
     let result = await collection.deleteOne(query);
 
     // Invalidate cache after delete
-    redisClient.del('movies', (err, reply) => {
+    redisClient.del(`movie:${movieId}`, (err) => {
+      if (err) {
+        console.error(`Error invalidating movie in Redis: ${err}`);
+      } else {
+        console.log('Invalidated movie in Redis after delete');
+      }
+    });
+
+    redisClient.del('movies', (err) => {
       if (err) {
         console.error(`Error invalidating Redis cache: ${err}`);
       } else {
@@ -163,7 +218,6 @@ router.delete("/:id", async (req, res, next) => {
     res.status(500).json({ error: e.message });
   }
 });
-
 
 app.use('/movies', router);
 
